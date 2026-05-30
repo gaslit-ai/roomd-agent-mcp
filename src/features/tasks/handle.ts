@@ -43,6 +43,7 @@ import type {
   NotificationOptions,
   RequestTaskStore,
 } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { Logger } from "../../kernel/logger.js";
 
 /**
  * Structured failure. The feature also accepts a plain `Error`, which is
@@ -125,6 +126,8 @@ export interface TaskHandleInit {
    * the handle aborts the bridge's signal and force-fails the task.
    */
   readonly taskTimeoutMs: number;
+  /** Kernel logger for internal failures (store writes, notifications). */
+  readonly logger: Logger;
 }
 
 /**
@@ -145,6 +148,7 @@ export class TaskHandleImpl implements TaskHandle {
   readonly #transport: NotificationSink;
   readonly #progressToken: string | number | undefined;
   readonly #metaNamespace: string;
+  readonly #logger: Logger;
 
   /** Non-terminal sub-state. Terminal state is tracked by `#terminating`. */
   #phase: "working" | "input_required" = "working";
@@ -170,6 +174,7 @@ export class TaskHandleImpl implements TaskHandle {
     this.#transport = init.transport;
     this.#progressToken = init.progressToken;
     this.#metaNamespace = init.metaNamespace;
+    this.#logger = init.logger;
     this.#settled = new Promise<void>((resolve) => {
       this.#resolveSettled = resolve;
     });
@@ -178,6 +183,10 @@ export class TaskHandleImpl implements TaskHandle {
     // timer never keeps the process alive on its own.
     const deadline = setTimeout(() => {
       this.#deadline = undefined;
+      this.#logger.warn("task exceeded run deadline", {
+        taskId: this.taskId,
+        timeoutMs: init.taskTimeoutMs,
+      });
       this.#ac.abort();
       this.fail({
         name: "TaskTimeout",
@@ -411,7 +420,6 @@ export class TaskHandleImpl implements TaskHandle {
   }
 
   #logError(context: string, err: unknown): void {
-    // eslint-disable-next-line no-console
-    console.error(`[tasks] ${context}:`, err);
+    this.#logger.error(`tasks: ${context}`, { taskId: this.taskId, err });
   }
 }

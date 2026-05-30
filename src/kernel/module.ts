@@ -16,20 +16,27 @@
 // testable and lets new modules drop in without touching existing ones.
 import type { ServerCapabilities } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { Logger } from "./logger.js";
 
 /**
- * Context handed to every module's `attach()` invocation: the shared server
- * handle (where capabilities and request handlers live) and a shutdown
- * signal.
+ * Context handed to every module's `attach()` invocation: the server handle
+ * (where capabilities and request handlers live), a shutdown signal, and the
+ * kernel logger.
+ *
+ * In stateful mode the kernel attaches a fresh set of modules per MCP session,
+ * so `server` and `shutdown` are scoped to ONE session: `shutdown` fires when
+ * that session ends (client DELETE, idle reap) or the whole kernel stops.
  */
 export interface AttachContext {
   readonly server: McpServer;
   /**
-   * Abort signal fired when the kernel is shutting down. Modules that own
-   * long-lived resources (background workers, SSE subscriptions, …) should
-   * listen on this and unwind cleanly.
+   * Abort signal fired when this session (or the whole kernel) is shutting
+   * down. Modules that own long-lived resources (background workers, SSE
+   * subscriptions, …) should listen on this and unwind cleanly.
    */
   readonly shutdown: AbortSignal;
+  /** Kernel logger — modules should log through this, not `console`. */
+  readonly logger: Logger;
 }
 
 /**

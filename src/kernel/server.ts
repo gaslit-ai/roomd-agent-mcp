@@ -2,17 +2,25 @@
 //
 // The kernel composes two independent inputs — transport and modules — into
 // one running server. It owns:
-//   - Construction of the `McpServer` with merged capabilities.
-//   - Module attachment: each module's `attach({ server, shutdown })` runs in
-//     declared order.
-//   - Transport binding (`mcpServer.connect(transport)`).
+//   - Per-session construction of the `McpServer` with merged capabilities.
+//   - Module attachment: each module's `attach({ server, shutdown, logger })`
+//     runs in declared order.
+//   - Transport binding, with one connected server PER MCP session in
+//     stateful mode (see `transport.ts`).
 //   - Graceful shutdown: signal `shutdown`, run `module.detach?()` in reverse
-//     order, then `transport.close()`.
+//     order, then close the server (and transport).
 //
 // The kernel does NOT know about tasks, tools, opencode, or any specific
 // feature. Adding a new feature never edits this file. An agent is not a
 // kernel concern — a module receives whatever it needs as an explicit
 // constructor dependency, wired by the composition root.
+//
+// WHY A MODULE FACTORY: feature modules carry per-instance state (a tasks
+// module owns its live-handle map and shutdown wiring). Stateful mode attaches
+// a fresh module set per session, so each session is isolated; sharing one
+// instance across sessions would cross-wire their state. Backend dependencies
+// (an agent) are captured by the factory closure and shared — only the
+// MCP-side plumbing is per-session.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   InMemoryTaskStore,
@@ -26,6 +34,7 @@ import {
   createStreamableHttpTransport,
   type AgentTransportHandle,
 } from "./transport.js";
+import { createConsoleLogger, type Logger } from "./logger.js";
 
 /**
  * The single argument to `createAgentMcpServer`. A composition root builds
@@ -36,18 +45,24 @@ export interface AgentMcpServerOptions {
   readonly info: { name: string; version: string };
   /**
    * Optional human-readable instructions surfaced in the MCP init handshake
-   * (Spec §Initialization). Clients render this string in their server-info
-   * UI; it should describe how to use the server's tools/resources.
-   * Pass-through to the SDK's `instructions` field.
+   * (Spec §Initialization). Pass-through to the SDK's `instructions` field.
    */
   readonly instructions?: string;
   /** Transport configuration (bind, auth, CORS, resumability). */
   readonly transport: McpTransportConfig;
   /**
-   * Modules to attach (features). Attached in the declared order; detached
-   * in reverse order on shutdown.
+   * Factory producing a FRESH set of feature modules. Called once per MCP
+   * session in stateful mode (once total in stateless mode), so each session
+   * gets isolated module state. Modules are attached in the returned order and
+   * detached in reverse on session/kernel shutdown. Capture shared backend
+   * dependencies (an agent) in the factory closure.
    */
-  readonly modules: ReadonlyArray<AgentModule>;
+  readonly createModules: () => ReadonlyArray<AgentModule>;
+  /**
+   * Logger for kernel and module diagnostics. Defaults to a structured
+   * console logger tagged with `info.name`. Pass `noopLogger` to silence.
+   */
+  readonly logger?: Logger;
 }
 
 /**
@@ -59,102 +74,119 @@ export interface AgentMcpServerHandle {
 }
 
 /**
- * The kernel's only public function. Builds the MCP server, attaches the
- * modules, binds the transport, returns when listening.
+ * The kernel's only public function. Binds the transport and, for each MCP
+ * session, builds the server, attaches fresh modules, and connects. Returns
+ * once listening.
  */
 export async function createAgentMcpServer(
   opts: AgentMcpServerOptions,
 ): Promise<AgentMcpServerHandle> {
-  // 1. Merge capabilities. `tools: {}` is always present so a recipe with
-  //    zero feature modules still gets a tools-capable server.
-  const capabilities: ServerCapabilities = deepMergeCapabilities(
-    { tools: {} },
-    ...opts.modules.map((m) => m.capabilities ?? {}),
-  );
+  const logger = opts.logger ?? createConsoleLogger({ name: opts.info.name });
 
-  // 2. Construct the SDK server. Install BOTH a `TaskStore` (where task
-  //    metadata and results live) and a `TaskMessageQueue` (the side-channel
-  //    that `tasks/result` drains).
-  const taskStore = new InMemoryTaskStore();
-  const taskMessageQueue = new InMemoryTaskMessageQueue();
-  const mcpServer = new McpServer(opts.info, {
-    capabilities,
-    taskStore,
-    taskMessageQueue,
-    ...(opts.instructions !== undefined
-      ? { instructions: opts.instructions }
-      : {}),
-  });
+  // Build and connect a server for ONE session's transport, returning a
+  // disposer. Invoked by the transport layer per session (stateful) or once
+  // at startup (stateless).
+  const connectSession = async (
+    transport: Transport,
+  ): Promise<() => Promise<void>> => {
+    const modules = opts.createModules();
 
-  // 3. Attach modules in declared order. Each gets the shared server and a
-  //    shutdown signal scoped to this kernel instance.
-  //
-  //    Attachment runs BEFORE transport connect because the SDK's
-  //    `Server.registerCapabilities` (called transitively by
-  //    `McpServer.registerTool` / `experimental.tasks.registerToolTask`)
-  //    throws once a transport is connected. Modules register capabilities at
-  //    attach time, so they must run first.
-  const ac = new AbortController();
-  const attached: AgentModule[] = [];
-  try {
-    for (const module of opts.modules) {
-      await module.attach({ server: mcpServer, shutdown: ac.signal });
-      attached.push(module);
+    // Merge capabilities. `tools: {}` is always present so a recipe with zero
+    // feature modules still gets a tools-capable server.
+    const capabilities: ServerCapabilities = deepMergeCapabilities(
+      { tools: {} },
+      ...modules.map((m) => m.capabilities ?? {}),
+    );
+
+    // Each session gets its own TaskStore + TaskMessageQueue — task state is
+    // isolated per session.
+    const taskStore = new InMemoryTaskStore();
+    const taskMessageQueue = new InMemoryTaskMessageQueue();
+    const mcpServer = new McpServer(opts.info, {
+      capabilities,
+      taskStore,
+      taskMessageQueue,
+      ...(opts.instructions !== undefined
+        ? { instructions: opts.instructions }
+        : {}),
+    });
+
+    // Per-session shutdown signal: fired when this session ends (client
+    // DELETE, idle reap) or the whole kernel stops.
+    const ac = new AbortController();
+    const attached: AgentModule[] = [];
+    try {
+      // Attach BEFORE connect: the SDK's `registerCapabilities` (called
+      // transitively by `registerTool` / `registerToolTask`) throws once a
+      // transport is connected. Modules register at attach time.
+      for (const module of modules) {
+        await module.attach({ server: mcpServer, shutdown: ac.signal, logger });
+        attached.push(module);
+      }
+    } catch (err) {
+      ac.abort();
+      await detachReverse(attached, logger);
+      throw err;
     }
-  } catch (err) {
-    // Best-effort rollback: detach what we attached so a half-built kernel
-    // never returns to the caller.
-    ac.abort();
-    await detachReverse(attached);
-    throw err;
-  }
 
-  // 4. Bring up the transport and connect the server to it.
-  let transport: AgentTransportHandle;
-  try {
-    transport = await createStreamableHttpTransport(opts.transport);
-  } catch (err) {
-    ac.abort();
-    await detachReverse(attached);
-    throw err;
-  }
+    try {
+      await mcpServer.connect(transport);
+    } catch (err) {
+      ac.abort();
+      await detachReverse(attached, logger);
+      throw err;
+    }
 
-  try {
-    await mcpServer.connect(transport.sdkTransport as Transport);
-  } catch (err) {
-    ac.abort();
-    await detachReverse(attached);
-    await transport.close();
-    throw err;
-  }
+    // Idempotent: teardown can be reached more than one way (DELETE, the idle
+    // reaper, a failed init, kernel close). Running detach/close twice is not
+    // contractually safe for modules, so guard here as well as at call sites.
+    let disposed = false;
+    return async () => {
+      if (disposed) return;
+      disposed = true;
+      ac.abort();
+      await detachReverse(attached, logger);
+      try {
+        await mcpServer.close();
+      } catch (err) {
+        logger.error("session server close failed", { err });
+      }
+    };
+  };
+
+  const transport: AgentTransportHandle = await createStreamableHttpTransport(
+    opts.transport,
+    connectSession,
+    logger,
+  );
+  logger.info("agent MCP server listening", {
+    url: transport.url,
+    stateful: opts.transport.stateful,
+  });
 
   return {
     url: transport.url,
     close: async () => {
-      ac.abort();
-      await detachReverse(opts.modules);
+      logger.info("agent MCP server shutting down");
       await transport.close();
     },
   };
 }
 
 /**
- * Detach every module in reverse-attachment order. Errors are swallowed
+ * Detach every module in reverse-attachment order. Errors are logged
  * per-module so one misbehaving detach doesn't strand the others.
  */
 async function detachReverse(
   modules: ReadonlyArray<AgentModule>,
+  logger: Logger,
 ): Promise<void> {
   for (const module of [...modules].reverse()) {
     if (!module.detach) continue;
     try {
       await module.detach();
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error(
-        `[agent-kernel] module detach failed (${module.name}):`,
-        err,
-      );
+      logger.error("module detach failed", { module: module.name, err });
     }
   }
 }

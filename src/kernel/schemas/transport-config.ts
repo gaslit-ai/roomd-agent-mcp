@@ -40,8 +40,32 @@ export const McpTransportConfigSchema = z.object({
   /**
    * If `true`, the transport returns JSON responses instead of upgrading
    * to SSE for non-task requests. Default `false` (SSE preferred).
+   *
+   * RECOMMENDED `true` for task-augmented servers: with JSON responses there
+   * are no SSE streams, so `tasks/get` is already JSON (spec-compliant) and
+   * the kernel never has to flip the transport's response mode per request
+   * (see the `tasks/get` note in `transport.ts`).
    */
   enableJsonResponse: z.boolean().default(false),
+
+  /**
+   * Stateful only. Maximum number of concurrent sessions kept in memory. A
+   * fresh `initialize` beyond this ceiling is rejected with HTTP 503. This
+   * bounds memory against clients that `initialize` and never send DELETE
+   * (the MCP transport reclaims a session only on an explicit DELETE — never
+   * on disconnect). Default `1000`.
+   */
+  maxSessions: z.number().int().positive().default(1000),
+
+  /**
+   * Stateful only. Sessions with no request for this many milliseconds are
+   * reclaimed by a background sweeper. Necessary because a client that
+   * initializes and walks away (one-shot tooling, a crash, a dropped
+   * connection) would otherwise pin its session — and its per-session server,
+   * task store, and workers — for the process lifetime. `0` disables reaping
+   * (sessions live until DELETE or shutdown). Default `300000` (5 minutes).
+   */
+  sessionIdleTimeoutMs: z.number().int().min(0).default(300_000),
 
   /** Optional HTTP Basic auth user; pairs with `basicAuthPassword`. */
   basicAuthUser: z.string().min(1).optional(),

@@ -6,7 +6,16 @@ export {
 } from "./module.js";
 
 export {
+  type Logger,
+  type LogLevel,
+  type ConsoleLoggerOptions,
+  createConsoleLogger,
+  noopLogger,
+} from "./logger.js";
+
+export {
   type AgentTransportHandle,
+  type SessionConnector,
   createStreamableHttpTransport,
 } from "./transport.js";
 

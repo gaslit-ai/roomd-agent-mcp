@@ -51,6 +51,10 @@ single task-augmented `ask` tool at `http://127.0.0.1:4317/mcp`. The
 [example README](examples/opencode-server/README.md) walks through driving it
 with curl.
 
+`OPENCODE_MODEL` must name a model registered in your opencode provider config;
+an unregistered id fails the task with `ProviderModelNotFoundError` (surfaced in
+opencode's own log, not the agent server's).
+
 ## Public API
 
 Import from the package root — it re-exports each layer's public boundary
@@ -66,6 +70,9 @@ import {
 } from "@gaslit-ai/roomd-agent-mcp";
 ```
 
+`createAgentMcpServer` takes a **`createModules` factory** (invoked once per
+session — see below) rather than module instances, plus an optional `logger`.
+
 ## Independence contract
 
 `src/` imports **only** from:
@@ -78,6 +85,44 @@ import {
 It does not import from anywhere outside this package. This boundary is what
 makes the runtime portable; keep it intact.
 
+## Sessions, limits, and logging
+
+**Per-session isolation (stateful mode, the default).** Each MCP client gets
+its own transport and server, keyed by `mcp-session-id`: a fresh `initialize`
+mints a session, later requests route to it by header, and a `DELETE` tears it
+down. (A single shared transport can only ever hold one session — the second
+client's `initialize` is rejected with "Server already initialized" — so the
+kernel keeps one per session.) Because feature modules carry per-session state,
+you pass a **`createModules` factory**, not instances; the kernel calls it once
+per session. Capture shared backends (an agent) in the factory closure — one
+backend, many sessions.
+
+**Bounding sessions.** The MCP transport reclaims a session only on an explicit
+`DELETE` — *never* on a client disconnect — so the kernel adds two guards
+(transport config):
+
+- `sessionIdleTimeoutMs` (default `300000`) — a background sweeper reclaims
+  sessions idle longer than this. Requests in flight keep their session alive.
+- `maxSessions` (default `1000`) — a fresh `initialize` past this ceiling is
+  rejected with `503`.
+
+**Stateless mode** (`stateful: false`) builds and disposes a transport + server
+per request (the SDK forbids reusing a stateless transport across requests).
+
+**Logging.** The kernel and its modules log through an injected `Logger`
+(`AgentMcpServerOptions.logger`; default a structured console logger — pass
+`noopLogger` to silence, or your own to bridge into pino/OpenTelemetry). Task
+bridge failures, idle reaps, and transport errors surface here, so a failed
+task is never silent.
+
+**`tasks/get` and `enableJsonResponse`.** Set `enableJsonResponse: true` for
+task-augmented servers (the example does): with JSON responses there are no SSE
+streams, so `tasks/get` is already spec-compliant and the kernel never flips
+response modes per request. With `enableJsonResponse: false` the kernel briefly
+forces JSON for `tasks/get`; that flip mutates per-transport state, so it is
+only sound when at most one request is in flight on a session at a time (a
+concurrency-safe out-of-band path is a tracked follow-up).
+
 ## A note on the MCP SDK pin
 
 `@modelcontextprotocol/sdk` is **pinned to an exact version** in
@@ -88,7 +133,8 @@ experimental or keeps private:
 - the `server/webStandardStreamableHttp.js` and `server/zod-compat.js`
   subpaths, and
 - a private nested field, `transport._webStandardTransport._enableJsonResponse`,
-  poked in `src/kernel/transport.ts` to force JSON responses on `tasks/get`.
+  poked in `src/kernel/transport.ts` to force JSON responses on `tasks/get`
+  (only when `enableJsonResponse: false`; see "Sessions, limits, and logging").
 
 `tests/mcp-sdk-surface.test.ts` is a canary for the one surface TypeScript
 cannot see (the private field). Typecheck guards the rest. When bumping the

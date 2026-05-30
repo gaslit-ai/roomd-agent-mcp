@@ -32,7 +32,7 @@ tasks feature, the MCP server) and the small bridge between them.
 ## Run
 
 ```
-OPENCODE_MODEL=ollama/qwen3:latest pnpm tsx examples/opencode-server/server.ts
+OPENCODE_MODEL=ollama/qwen3.6:128k pnpm tsx examples/opencode-server/server.ts
 ```
 
 It prints `example-agent listening at http://127.0.0.1:4317/mcp`.

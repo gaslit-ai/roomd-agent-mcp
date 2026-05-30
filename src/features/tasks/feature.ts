@@ -264,6 +264,7 @@ export function createTasksFeature<TShape extends z.ZodRawShape>(
             progressToken: extra._meta?.progressToken,
             metaNamespace: config.metaNamespace,
             taskTimeoutMs: config.taskTimeoutMs,
+            logger: ctx.logger,
           });
           handles.set(task.taskId, handle);
 
@@ -276,10 +277,19 @@ export function createTasksFeature<TShape extends z.ZodRawShape>(
             .then(() => deps.start(typedArgs, handle))
             .then(
               (result) => handle.complete(result),
-              (err: unknown) =>
-                handle.fail(
-                  err instanceof Error ? err : new Error(String(err)),
-                ),
+              (err: unknown) => {
+                const error =
+                  err instanceof Error ? err : new Error(String(err));
+                // Log the real failure at the source — otherwise a thrown
+                // bridge becomes an opaque task result with nothing on the
+                // server side to debug from.
+                ctx.logger.error("task bridge failed", {
+                  taskId: task.taskId,
+                  tool: config.toolName,
+                  err: error,
+                });
+                handle.fail(error);
+              },
             );
           // Cleanup is bound to the handle settling — NOT to `start`.
           // The run deadline guarantees `settled` resolves, so the entry

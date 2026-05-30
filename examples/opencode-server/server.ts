@@ -56,7 +56,12 @@ const agent = createOpencodeAgent(
 // 2. THE TASKS FEATURE — generic; no opencode. `start` is the bridge: it
 //    drives one task to a terminal state by running the agent. Returning a
 //    CallToolResult completes the task; throwing fails it.
-const tasks = createTasksFeature({
+//
+//    Handed to the kernel as a FACTORY: in stateful mode the kernel builds a
+//    fresh tasks module per MCP session (so task state is isolated per
+//    session). The shared `agent` above is captured by the closure — one
+//    backend, many sessions.
+const makeTasks = () => createTasksFeature({
   config: TasksFeatureConfigSchema.parse({
     toolName: "ask",
     description:
@@ -125,7 +130,7 @@ const server = await createAgentMcpServer({
     stateful: true,
     enableJsonResponse: true,
   }),
-  modules: [tasks],
+  createModules: () => [makeTasks()],
 });
 
 console.log(`example-agent listening at ${server.url}`);
